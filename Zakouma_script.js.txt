@@ -1,0 +1,227 @@
+
+var DATE_DEBUT = '2024-02-05';
+var DATE_FIN = '2024-02-07';
+var MAX_CLOUD = 20;
+var zone = geometry;
+
+var reference = eau.merge(eau_vegetation).merge(autres);
+
+// Chargement des images Sentinel-2
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(zone)
+  .filterDate(DATE_DEBUT, DATE_FIN)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', MAX_CLOUD));
+
+function masquerNuages(image) {
+  var scl = image.select('SCL');
+  var masque = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10));
+  return image.updateMask(masque)
+    .divide(10000)
+    .copyProperties(image, image.propertyNames());
+}
+
+function ajouterIndices(image) {
+  var ndvi   = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var mndwi2 = image.normalizedDifference(['B3', 'B12']).rename('MNDWI2');
+  var ndmi   = image.normalizedDifference(['B8', 'B11']).rename('NDMI');
+  return image.addBands([ndvi, mndwi2, ndmi]);
+}
+
+var s2Clean = s2.map(masquerNuages).map(ajouterIndices);
+
+print('Nombre d\'images Sentinel-2 :', s2Clean.size());
+
+var bandes = ['B2', 'B3', 'B4', 'B8', 'B12', 'NDVI', 'MNDWI2', 'NDMI'];
+
+var composite = s2Clean.select(bandes).median().clip(zone);
+
+// Affichage de contrôle
+
+Map.addLayer(composite, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.2}, 'Sentinel-2 RGB');
+
+Map.addLayer(composite, {bands: ['B8', 'B4', 'B3'], min: 0, max: 0.3}, 'Sentinel-2 Fausses Couleurs', false);
+
+Map.addLayer(composite.select('NDVI'), {
+  min: -1, max: 1,
+  palette: ['brown', 'orange', 'yellow', 'green', 'darkgreen']
+}, 'NDVI', false);
+
+Map.addLayer(composite.select('MNDWI2'), {
+  min: -0.8, max: 0.8,
+  palette: ['brown', 'white', 'cyan', 'blue', 'darkblue']
+}, 'MNDWI2', false);
+
+Map.addLayer(composite.select('NDMI'), {
+  min: -1, max: 1,
+  palette: ['red', 'orange', 'white', 'lightgreen', 'darkgreen']
+}, 'NDMI', false);
+
+// Classification (split 70 % entraînement / 30 % validation)
+
+var train = composite.select(bandes).sampleRegions({
+  collection: reference,
+  properties: ['Class'],
+  scale: 10
+}).randomColumn();
+
+var trainingSample = train.filter('random <= 0.7');
+var validationSample = train.filter('random > 0.7');
+
+var classifier = ee.Classifier.smileRandomForest(500).train({
+  features: trainingSample,
+  classProperty: 'Class',
+  inputProperties: bandes
+});
+
+var classification = composite.classify(classifier);
+
+Map.addLayer(classification, {min: 1, max: 3, palette: ['blue', 'green', 'beige']}, 'Classification RF');
+
+Map.centerObject(zone, 11);
+
+// Importance des variables 
+var importance = ee.Dictionary(classifier.explain().get('importance'));
+var fcImportance = ee.FeatureCollection(
+  importance.keys().map(function(k) {
+    return ee.Feature(null, {
+      variable: k,
+      importance: importance.get(k)
+    });
+  })
+).sort('importance', true);   
+
+// Graphique
+var chart = ui.Chart.feature.byFeature(fcImportance, 'variable', 'importance')
+  .setChartType('BarChart')    
+  .setOptions({
+    title: 'Importance des variables - Random Forest PNZ',
+    hAxis: {title: 'Importance (Mean Decrease in Impurity)'},
+    vAxis: {title: 'Variable'},
+    legend: {position: 'none'}
+  });
+print(chart);
+
+// Évaluation (validation interne)
+
+var validated = validationSample.classify(classifier);
+var matrix = validated.errorMatrix('Class', 'classification');
+
+print('Matrice de confusion', matrix);
+print('Précision globale', matrix.accuracy());
+print('Kappa', matrix.kappa());
+print('F1 score', matrix.fscore());
+print('Précision utilisateur', matrix.consumersAccuracy());
+print('Précision producteur', matrix.producersAccuracy());
+print('Importance des variables', classifier.explain());
+
+// Tableau des métriques par classe
+
+var metriques = ee.FeatureCollection([
+  ee.Feature(null, {
+    'classe': 'eau',
+    'f1_score': matrix.fscore().get([1]),
+    'precision_utilisateur': matrix.consumersAccuracy().get([0, 1]),
+    'precision_producteur': matrix.producersAccuracy().get([1, 0]),
+    'erreur_commission': ee.Number(1).subtract(matrix.consumersAccuracy().get([0, 1])),
+    'erreur_omission': ee.Number(1).subtract(matrix.producersAccuracy().get([1, 0]))
+  }),
+  ee.Feature(null, {
+    'classe': 'eau_vegetation',
+    'f1_score': matrix.fscore().get([2]),
+    'precision_utilisateur': matrix.consumersAccuracy().get([0, 2]),
+    'precision_producteur': matrix.producersAccuracy().get([2, 0]),
+    'erreur_commission': ee.Number(1).subtract(matrix.consumersAccuracy().get([0, 2])),
+    'erreur_omission': ee.Number(1).subtract(matrix.producersAccuracy().get([2, 0]))
+  }),
+  ee.Feature(null, {
+    'classe': 'autres',
+    'f1_score': matrix.fscore().get([3]),
+    'precision_utilisateur': matrix.consumersAccuracy().get([0, 3]),
+    'precision_producteur': matrix.producersAccuracy().get([3, 0]),
+    'erreur_commission': ee.Number(1).subtract(matrix.consumersAccuracy().get([0, 3])),
+    'erreur_omission': ee.Number(1).subtract(matrix.producersAccuracy().get([3, 0]))
+  })
+]);
+
+// Tableau des surfaces
+
+var surfaces = ee.FeatureCollection([1, 2, 3].map(function(classValue) {
+  var noms = {1: 'eau', 2: 'eau_vegetation', 3: 'autres'};
+  var surface = classification.eq(classValue).multiply(ee.Image.pixelArea()).divide(10000)
+    .reduceRegion({reducer: ee.Reducer.sum(), geometry: zone, scale: 10, maxPixels: 1e13})
+    .get('classification');
+  return ee.Feature(null, {'classe': noms[classValue], 'surface_ha': surface});
+}));
+
+print('Surfaces par classe (ha)', surfaces);
+
+// ============================================================
+// EXPORTS
+// ============================================================
+
+// --- Images ---
+
+Export.image.toDrive({
+  image: classification,
+  description: 'Zakouma_RF_fev2024',
+  folder: 'GEE_Zakouma',
+  fileNamePrefix: 'Zakouma_RF_fev2024',
+  region: zone,
+  scale: 10,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  formatOptions: {cloudOptimized: true}
+});
+
+Export.image.toDrive({
+  image: composite.select(['B4', 'B3', 'B2']),
+  description: 'Zakouma_VC_fev2024',
+  folder: 'GEE_Zakouma',
+  fileNamePrefix: 'Zakouma_VC_fev2024',
+  region: zone,
+  scale: 10,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  formatOptions: {cloudOptimized: true}
+});
+
+Export.image.toDrive({
+  image: composite.select(['B8', 'B4', 'B3']),
+  description: 'Zakouma_FC_fev2024',
+  folder: 'GEE_Zakouma',
+  fileNamePrefix: 'Zakouma_FC_fev2024',
+  region: zone,
+  scale: 10,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  formatOptions: {cloudOptimized: true}
+});
+
+Export.image.toDrive({
+  image: composite.select('NDVI'),
+  description: 'Zakouma_NDVI_fev2024',
+  folder: 'GEE_Zakouma',
+  fileNamePrefix: 'Zakouma_NDVI_fev2024',
+  region: zone,
+  scale: 10,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  formatOptions: {cloudOptimized: true}
+});
+
+// --- Tableaux ---
+
+Export.table.toDrive({
+  collection: metriques,
+  description: 'Zakouma_Metriques_Classes',
+  folder: 'GEE_Zakouma',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: surfaces,
+  description: 'Zakouma_Surfaces_Classes',
+  folder: 'GEE_Zakouma',
+  fileFormat: 'CSV'
+});

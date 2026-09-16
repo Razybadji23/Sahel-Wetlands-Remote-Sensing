@@ -1,0 +1,167 @@
+var zone = geometry;
+var date = '2021-02-09';         
+
+var habitats = eau_permanent.merge(eau_temporaire).merge(marecage).merge(foret_inondee).merge(sol_nu_sec)
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(zone)
+  .filterDate('2021-02-08', '2021-02-10')
+  .filter(ee.Filter.eq('MGRS_TILE', '33PYQ'));   
+
+print('Nombre d\'images trouvées :', s2.size());
+
+var VC = { min: 0, max: 3000, bands: ['B4', 'B3', 'B2']};
+var FC = {min: 0, max: 3000, bands: ['B8', 'B4', 'B3']};
+
+Map.centerObject(zone, 10);
+var image = s2.first();
+Map.addLayer(image.clip(zone), VC, 'RGB');
+Map.addLayer(image.clip(zone), FC, 'Fausse_Couleur');
+
+// Indices
+
+var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var mndwi2 = image.normalizedDifference(['B3', 'B12']).rename('MNDWI2');
+
+// Visualization
+
+var ndviVis = { min: -1, max: 1, palette: ['red', 'yellow', 'green']};
+var mndwiVis = { min: -1, max: 1, palette: ['white', 'green', 'blue']};
+
+Map.addLayer(ndvi.clip(zone), ndviVis,  'NDVI');
+Map.addLayer(mndwi2.clip(zone), mndwiVis, 'MNDWI2');
+
+
+// =========================
+// SEUILLAGE MNDWI
+// =========================
+var seuilMNDWI2 = 0;   // seuil fixe
+var bluePalette = [
+  '#f7fbff', '#deebf7', '#c6dbef', '#9ecae1',
+  '#6baed6', '#4292c6', '#2171b5', '#084594'
+];
+var eauMNDWI2 = mndwi2.gt(seuilMNDWI2).rename('eau_mndwi2').clip(zone);   
+var mndwi2Seuille = mndwi2.updateMask(eauMNDWI2).clip(zone);
+Map.addLayer(mndwi2Seuille, {min: 0, max: 1, palette: bluePalette}, 'MNDWI seuillé');
+
+// Variables d'entrées
+
+var image_RF = image.addBands(ndvi).addBands(mndwi2);
+
+// variables
+var bands = ['B2', 'B3', 'B4', 'B8', 'B12', 'NDVI', 'MNDWI2'];
+var stack = image_RF.select(bands);
+
+// Classification
+var habitats = eau_permanent.merge(eau_temporaire).merge(marecage).merge(foret_inondee).merge(sol_nu_sec);
+
+print(habitats, 'habitats samples');
+
+var train = stack.sampleRegions({
+  collection: habitats,
+  properties: ['class'],
+  scale: 10
+}).randomColumn();
+
+var trainingSample = train.filter('random <= 0.7');
+var validationSample = train.filter('random > 0.7');
+
+var classifier = ee.Classifier.smileRandomForest(500).train({
+  features: trainingSample,
+  classProperty: 'class',
+  inputProperties: bands
+});
+
+var classif = stack.classify(classifier);
+Map.addLayer(classif.clip(zone), {
+  min: 1,
+  max: 5,
+  palette: ["#0e22ff", "#08c7ff", "#59ff9a", "#1f831d", "#ffcb9f"]
+}, 'Habitats_Fitri_ ' + date);
+
+
+// Importance des variables 
+var importance = ee.Dictionary(classifier.explain().get('importance'));
+var fcImportance = ee.FeatureCollection(
+  importance.keys().map(function(k) {
+    return ee.Feature(null, {
+      variable: k,
+      importance: importance.get(k)
+    });
+  })
+).sort('importance', true);   
+
+// Graphique
+var chart = ui.Chart.feature.byFeature(fcImportance, 'variable', 'importance')
+  .setChartType('BarChart')    
+  .setOptions({
+    title: 'Importance des variables - Random Forest lac Fitri',
+    hAxis: {title: 'Importance (Mean Decrease in Impurity)'},
+    vAxis: {title: 'Variable'},
+    legend: {position: 'none'}
+  });
+print(chart);
+
+// =========================
+// Évaluation
+// =========================
+
+var validated = validationSample.classify(classifier);
+var matrix = validated.errorMatrix('class', 'classification');
+print('Validation error matrix', matrix);
+print('Validation accuracy', matrix.accuracy());
+print('Kappa', matrix.kappa());
+print('F1 score', matrix.fscore());
+print('Consumers Accuracy', matrix.consumersAccuracy());
+print('Producers Accuracy', matrix.producersAccuracy());
+print('Classifier details', classifier.explain());
+
+
+// =========================
+// Export
+// =========================
+
+Export.image.toDrive({
+  image: classif,
+  description: 'Habitats_Fitri_' + date,
+  region: geometry,
+  scale: 10,
+  crs: 'EPSG:32633',
+  maxPixels: 1e13,
+  formatOptions: { cloudOptimized: true }
+});
+
+// =========================
+// Statistiques de surface
+// =========================
+
+var pixelArea = ee.Image.pixelArea();
+var classMasks = {
+  1: classif.eq(1),
+  2: classif.eq(2),
+  3: classif.eq(3),
+  4: classif.eq(4),
+  5: classif.eq(5),
+};
+
+['eau_permanent', 'eau_temporaire', 'marecage', 'foret_inondee','sol_nu_sec'].forEach(function(name, i) {
+  var mask = classMasks[i+1];
+  var areaImage = mask.multiply(pixelArea).divide(10000);
+  var areaStat = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: zone,
+    scale: 10,
+    maxPixels: 1e13
+  });
+  print(name + ' area: ', areaStat.get('classification'), 'ha');
+});
+
+Export.image.toDrive({
+  image: ndvi,
+  description: 'NDVI_Fitri_' + date,
+  region: zone,
+  scale: 10,
+  crs: 'EPSG:32633',
+  maxPixels: 1e13,
+  formatOptions: { cloudOptimized: true }
+});
